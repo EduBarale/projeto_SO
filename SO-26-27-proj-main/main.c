@@ -35,7 +35,7 @@ static void process_conf(DataCenter *dc, int fd){
 			}
 
 			case CMD_RESERVE: {
-				Reservation reservation = {0};
+				Reservation reservation = {0}; 
 
 				size_t num_items = parse_reserve(fd, &reservation, MAX_RESERVATIONS_ITEMS);
 
@@ -195,7 +195,6 @@ int main(int argc, char **argv){
 		return 1;
 	}
 
-	/* (dentro do main) */
 
 	Queue queue = { .dc = &dc };
 	pthread_mutex_init(&queue.lock, NULL);
@@ -206,7 +205,7 @@ int main(int argc, char **argv){
 		return 1;
 	}
 
-	/* Nunca mais threads do que ficheiros */
+	/* Tem que ter threads do que ficheiros */
 	size_t n_threads = max_threads < queue.total ? max_threads : queue.total;
 
 	/* "+ 1" para o malloc nunca receber 0 */
@@ -218,7 +217,7 @@ int main(int argc, char **argv){
 		return 1;
 	}
 
-	/* Contamos as que arrancaram, porque a criação pode falhar a meio */
+	/* Contar as que arrancaram, porque a criação pode falhar a meio */
 	size_t started = 0;
 	for (size_t i = 0; i < n_threads; i++) {
 		if (pthread_create(&threads[started], NULL, worker, &queue) != 0) {
@@ -235,7 +234,7 @@ int main(int argc, char **argv){
 	for (size_t i = 0; i < started; i++)
 		pthread_join(threads[i], NULL);
 
-	/* As VMs são processos à parte: esperar por elas antes de destruir */
+	/* Eesperar pelas VMs antes de destruir */
 	datacenter_wait_all(&dc);
 
 	free(threads);
