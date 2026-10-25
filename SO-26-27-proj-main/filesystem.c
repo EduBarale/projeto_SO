@@ -49,183 +49,134 @@ int absolute_path(const char *path, char *buffer, size_t size){
 }
 
 
-/* ------------------------------------------------------------------ */
-/* Exercise 1: listing .conf files and copying directories             */
-/* ------------------------------------------------------------------ */
+/* Exercício 1: listar ficheiros .conf e copiar pastas */
 
-static int cmp_paths(const void *a, const void *b){
-  return strcmp(*(char * const *)a, *(char * const *)b);
+/* Compara dois caminhos (para ordenar) */
+static int compare_paths(const void *left, const void *right){
+  return strcmp(*(char * const *)left, *(char * const *)right);
 }
 
+/* Apaga a lista */
 void free_file_list(char **files, size_t count){
   for (size_t i = 0; i < count; i++)
     free(files[i]);
   free(files);
 }
 
+/* Lista os .conf de uma pasta (por ordem alfabética) */
 int list_conf_files(const char *dir, char ***files, size_t *count){
-  DIR *d = opendir(dir);
-  if (d == NULL)
+  DIR *folder = opendir(dir);
+  if (folder == NULL)
     return 1;
 
-  size_t cap = 8, n = 0;
-  char **arr = malloc(cap * sizeof(char *));
-  if (arr == NULL) {
-    closedir(d);
-    return 1;
-  }
+  char **list = NULL;
+  size_t total = 0;
+  struct dirent *item;
 
-  struct dirent *e;
-  while ((e = readdir(d)) != NULL) {
-    size_t len = strlen(e->d_name);
-    if (len <= 5 || strcmp(e->d_name + len - 5, ".conf") != 0)
+  while ((item = readdir(folder)) != NULL) {
+    /* só nomes que acabam em ".conf" */
+    size_t name_len = strlen(item->d_name);
+    if (name_len <= 5 || strcmp(item->d_name + name_len - 5, ".conf") != 0)
       continue;
 
     char path[MAX_PATH_SIZE];
-    int w = snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-    if (w < 0 || (size_t)w >= sizeof(path))
-      continue;
+    snprintf(path, sizeof(path), "%s/%s", dir, item->d_name);
 
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
-      continue;
-
-    if (n == cap) {
-      char **bigger = realloc(arr, cap * 2 * sizeof(char *));
-      if (bigger == NULL) {
-        free_file_list(arr, n);
-        closedir(d);
-        return 1;
-      }
-      arr = bigger;
-      cap *= 2;
-    }
-
-    arr[n] = strdup(path);
-    if (arr[n] == NULL) {
-      free_file_list(arr, n);
-      closedir(d);
-      return 1;
-    }
-    n++;
+    /* mais um lugar na lista */
+    list = realloc(list, (total + 1) * sizeof(char *));
+    list[total] = strdup(path);
+    total++;
   }
 
-  closedir(d);
+  closedir(folder);
 
-  // Same directory prefix everywhere, so sorting full paths == sorting names.
-  qsort(arr, n, sizeof(char *), cmp_paths);
+  qsort(list, total, sizeof(char *), compare_paths);
 
-  *files = arr;
-  *count = n;
+  *files = list;
+  *count = total;
   return 0;
 }
 
+/* Cria a pasta e as pastas de cima */
 int make_dirs(const char *path){
-  char tmp[MAX_PATH_SIZE];
-  size_t len = strlen(path);
+  char copy[MAX_PATH_SIZE];
+  snprintf(copy, sizeof(copy), "%s", path);
 
-  if (len == 0 || len >= sizeof(tmp))
-    return 1;
-
-  memcpy(tmp, path, len + 1);
-
-  for (char *p = tmp + 1; *p != '\0'; p++) {
-    if (*p == '/') {
-      *p = '\0';
-      if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+  for (char *letter = copy + 1; *letter != '\0'; letter++) {
+    if (*letter == '/') {
+      *letter = '\0';
+      if (mkdir(copy, S_IRWXU | S_IRWXG | S_IRWXO) != 0 && errno != EEXIST)
         return 1;
-      *p = '/';
+      *letter = '/';
     }
   }
 
-  if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+  if (mkdir(copy, S_IRWXU | S_IRWXG | S_IRWXO) != 0 && errno != EEXIST)
     return 1;
 
   return 0;
 }
 
-static int copy_file(const char *src, const char *dst, mode_t mode){
-  int in = open(src, O_RDONLY);
-  if (in < 0)
+/* Copia um ficheiro */
+static int copy_file(const char *from, const char *to, mode_t mode){
+  int original = open(from, O_RDONLY);
+  if (original < 0)
     return 1;
 
-  int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
-  if (out < 0) {
-    close(in);
+  int copy = open(to, O_WRONLY | O_CREAT | O_TRUNC, mode);
+  if (copy < 0) {
+    close(original);
     return 1;
   }
 
-  char buf[8192];
-  int rc = 0;
+  char piece[8192];
+  ssize_t size;
+  int status = 0;
 
-  while (rc == 0) {
-    ssize_t r = read(in, buf, sizeof(buf));
-
-    if (r == 0)
-      break;                     // EOF
-    if (r < 0) {
-      if (errno == EINTR)
-        continue;
-      rc = 1;
-      break;
-    }
-
-    size_t off = 0;
-    while (off < (size_t)r) {    // handle partial writes
-      ssize_t w = write(out, buf + off, (size_t)r - off);
-      if (w < 0) {
-        if (errno == EINTR)
-          continue;
-        rc = 1;
-        break;
-      }
-      off += (size_t)w;
-    }
+  while ((size = read(original, piece, sizeof(piece))) > 0) {
+    if (write(copy, piece, size) != size)
+      status = 1;
   }
+  if (size < 0)
+    status = 1;
 
-  close(in);
-  if (close(out) != 0)
-    rc = 1;
-
-  return rc;
+  close(original);
+  close(copy);
+  return status;
 }
 
-int copy_dir_recursive(const char *src, const char *dst){
-  if (make_dirs(dst) != 0)
+/* Copia uma pasta inteira */
+int copy_dir_recursive(const char *from, const char *to){
+  if (make_dirs(to) != 0)
     return 1;
 
-  DIR *d = opendir(src);
-  if (d == NULL)
+  DIR *folder = opendir(from);
+  if (folder == NULL)
     return 1;
 
-  int rc = 0;
-  struct dirent *e;
+  int status = 0;
+  struct dirent *item;
 
-  while (rc == 0 && (e = readdir(d)) != NULL) {
-    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+  while (status == 0 && (item = readdir(folder)) != NULL) {
+    if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0)
       continue;
 
-    char s[MAX_PATH_SIZE], t[MAX_PATH_SIZE];
-    int w1 = snprintf(s, sizeof(s), "%s/%s", src, e->d_name);
-    int w2 = snprintf(t, sizeof(t), "%s/%s", dst, e->d_name);
-    if (w1 < 0 || w2 < 0 || (size_t)w1 >= sizeof(s) || (size_t)w2 >= sizeof(t)) {
-      rc = 1;
+    char from_path[MAX_PATH_SIZE], to_path[MAX_PATH_SIZE];
+    snprintf(from_path, sizeof(from_path), "%s/%s", from, item->d_name);
+    snprintf(to_path, sizeof(to_path), "%s/%s", to, item->d_name);
+
+    struct stat info;
+    if (lstat(from_path, &info) != 0) {
+      status = 1;
       break;
     }
 
-    struct stat st;
-    if (lstat(s, &st) != 0) {
-      rc = 1;
-      break;
-    }
-
-    if (S_ISDIR(st.st_mode))
-      rc = copy_dir_recursive(s, t);
-    else if (S_ISREG(st.st_mode))
-      rc = copy_file(s, t, st.st_mode & 0777);
-    // other types (symlinks, sockets, ...) are skipped
+    if (S_ISDIR(info.st_mode))
+      status = copy_dir_recursive(from_path, to_path);
+    else if (S_ISREG(info.st_mode))
+      status = copy_file(from_path, to_path, info.st_mode);
   }
 
-  closedir(d);
-  return rc;
+  closedir(folder);
+  return status;
 }
