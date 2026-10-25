@@ -299,174 +299,216 @@ void vm_terminate(DataCenter *dc, Reservation *res, VM *vm) {
 /* Launching VMs (Exercise 2)                                          */
 /* ------------------------------------------------------------------ */
 
+/* Used only inside the child process after fork(): print a message and bail out.
+ * We use write() + _exit() on purpose (instead of fprintf/exit) because they are
+ * safe to call in a freshly forked child and don't flush the parent's buffers twice. */
 __attribute__((noreturn))
-static void child_fail(const char *msg) {
-	ssize_t r = write(STDERR_FILENO, msg, strlen(msg));
-	(void)r;
+static void die_in_child(const char *message) {
+	ssize_t written = write(STDERR_FILENO, message, strlen(message));
+	(void)written;   /* nothing useful to do if even this write fails */
 	_exit(1);
 }
 
-void spawn_vm_child(VM *vm, const char *vm_dir, const char *exec_path, const char *cpu_pct) {
-	struct rlimit lim;
+/* Runs in the child right after fork(): applies the resource limits of the VM,
+ * moves into its folder and replaces itself with the program (wrapped by cpulimit). */
+void spawn_vm_child(VM *vm, const char *vm_dir, const char *exec_path, const char *cpu_limit) {
+	struct rlimit limit;
 
-	/* RAM (GB -> bytes) */
-	lim.rlim_cur = (rlim_t)vm->type->required.ram << 30;
-	lim.rlim_max = lim.rlim_cur;
-	if (setrlimit(RLIMIT_AS, &lim) != 0)
-		child_fail("VM: setrlimit(RLIMIT_AS) failed\n");
+	/* Memory limit: the type gives it in GB, setrlimit wants bytes (<< 30 = * 2^30) */
+	limit.rlim_cur = (rlim_t)vm->type->required.ram << 30;
+	limit.rlim_max = limit.rlim_cur;
+	if (setrlimit(RLIMIT_AS, &limit) != 0)
+		die_in_child("VM: setrlimit(RLIMIT_AS) failed\n");
 
-	/* Disk (GB -> bytes), maximum size of each file the VM can create */
-	lim.rlim_cur = (rlim_t)vm->type->required.disk << 30;
-	lim.rlim_max = lim.rlim_cur;
-	if (setrlimit(RLIMIT_FSIZE, &lim) != 0)
-		child_fail("VM: setrlimit(RLIMIT_FSIZE) failed\n");
+	/* Disk limit, also GB -> bytes. Heads up: RLIMIT_FSIZE caps the size of
+	 * EACH file the VM creates, not the total space it uses. */
+	limit.rlim_cur = (rlim_t)vm->type->required.disk << 30;
+	limit.rlim_max = limit.rlim_cur;
+	if (setrlimit(RLIMIT_FSIZE, &limit) != 0)
+		die_in_child("VM: setrlimit(RLIMIT_FSIZE) failed\n");
 
-	/* The application runs inside the VM directory (its copied inputs). */
+	/* The program runs from inside the VM's own folder, where its input files were copied. */
 	if (chdir(vm_dir) != 0)
-		child_fail("VM: chdir to VM directory failed\n");
+		die_in_child("VM: chdir to VM directory failed\n");
 
-	execlp("cpulimit", "cpulimit", "-q", "-f", "-l", cpu_pct, "--", exec_path, (char *)NULL);
+	/* cpulimit throttles the program to the CPU percentage we computed.
+	 * If exec works, this process becomes cpulimit and never comes back here. */
+	execlp("cpulimit", "cpulimit", "-q", "-f", "-l", cpu_limit, "--", exec_path, (char *)NULL);
 
-	child_fail("VM: exec of cpulimit failed (is it installed?)\n");
+	/* Only reached if exec failed. */
+	die_in_child("VM: exec of cpulimit failed (is it installed?)\n");
 }
 
 /**
- * Percentage to give to cpulimit, following the formula in the statement:
- *   vCPU-of-VM / CPUs-per-server x number-of-servers x 100
- * NOTE: the statement's parenthesization is ambiguous. If the teachers
- * clarify it differently, only this function has to change.
+ * Works out the percentage we hand to cpulimit, using the formula from the statement:
+ *   vCPUs-of-the-VM / CPUs-per-server x number-of-servers x 100
+ * NOTE: the way the statement places the parentheses is ambiguous. If the
+ * teachers clarify it differently, this is the only function that needs to change.
+ * (The operations are kept in the same left-to-right order as the formula, so
+ * splitting it into steps below doesn't change the result.)
  */
-static int cpu_percent(const DataCenter *dc, const VM *vm) {
-	double cpus_per_server = dc->servers[0].total.cpu;   // all servers are equal
-	double pct = vm->type->required.cpu / cpus_per_server
-	             * (double)dc->num_servers * 100.0;
+static int cpu_limit_percent(const DataCenter *dc, const VM *vm) {
+	double cpus_per_server = dc->servers[0].total.cpu;   /* all servers are identical, so any one will do */
+	double vm_share_of_server = vm->type->required.cpu / cpus_per_server;
+	double percent = vm_share_of_server * (double)dc->num_servers * 100.0;
 
-	long p = lround(pct);
-	if (p < 1)
-		p = 1;
-	return (int)p;
+	long rounded = lround(percent);
+	if (rounded < 1)
+		rounded = 1;   /* cpulimit doesn't accept 0, so never go below 1% */
+	return (int)rounded;
 }
 
+/* Everything the monitor thread needs, bundled so we can pass it as a single pointer. */
 typedef struct {
 	DataCenter *dc;
 	Reservation *res;
 	VM *vm;
-} MonitorArg;
+} MonitorArgs;
 
-/** Waits for the VM process and destroys the VM. */
-static void wait_and_terminate(DataCenter *dc, Reservation *res, VM *vm) {
-	pid_t pid = vm->pid;
-	int status;
+/** Blocks until the VM's process ends, then cleans the VM up. */
+static void wait_for_vm_then_terminate(DataCenter *dc, Reservation *res, VM *vm) {
+	pid_t vm_pid = vm->pid;
+	int exit_status;
+	pid_t reaped_pid;
 
-	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+	/* If a signal interrupts waitpid we just try again. */
+	while ((reaped_pid = waitpid(vm_pid, &exit_status, 0)) < 0 && errno == EINTR)
 		;
+
+	/* Any other waitpid error is only reported: we still terminate the VM below,
+	 * otherwise the resources it reserved would never be released. */
+	if (reaped_pid < 0)
+		perror("waitpid");
 
 	vm_terminate(dc, res, vm);
 }
 
-static void *vm_monitor(void *arg) {
-	MonitorArg m = *(MonitorArg *)arg;
-	free(arg);
+/* Entry point of the per-VM monitor thread. */
+static void *monitor_thread_main(void *raw_args) {
+	/* Copy the arguments to the stack and free the heap block right away,
+	 * so we can't forget to do it later. */
+	MonitorArgs args = *(MonitorArgs *)raw_args;
+	free(raw_args);
 
-	wait_and_terminate(m.dc, m.res, m.vm);
+	wait_for_vm_then_terminate(args.dc, args.res, args.vm);
 	return NULL;
 }
 
 /**
- * Launches one VM. Returns 0 if the process was forked (from then on the
- * VM is owned by its monitor and must not be touched), 1 if it failed BEFORE
- * forking (the caller must then call vm_terminate()).
+ * Starts a detached thread that waits for the VM to finish and cleans it up.
+ * Returns 0 if the thread is running, 1 if it could not be created
+ * (nothing is left allocated in that case).
  */
-static int launch_vm(DataCenter *dc, Reservation *res, VM *vm) {
-	char vm_dir[MAX_PATH_SIZE];
-	char exec_abs[MAX_PATH_SIZE];
-	char cpu_pct[16];
+static int start_monitor_thread(DataCenter *dc, Reservation *res, VM *vm) {
+	MonitorArgs *args = malloc(sizeof(MonitorArgs));
+	pthread_t monitor_id;
 
-	int n = snprintf(vm_dir, sizeof(vm_dir), "%s/%s/%s", VM_ROOT_DIR, res->id, vm->id);
-	if (n < 0 || (size_t)n >= sizeof(vm_dir)) {
+	if (args == NULL)
+		return 1;
+
+	*args = (MonitorArgs){dc, res, vm};
+	if (pthread_create(&monitor_id, NULL, monitor_thread_main, args) != 0) {
+		free(args);   /* thread was not created, so nobody else will free this */
+		return 1;
+	}
+
+	pthread_detach(monitor_id);
+	return 0;
+}
+
+/**
+ * Launches a single VM. Returns 0 if the process was forked (from that moment on
+ * the monitor owns the VM and nobody else should touch it), or 1 if something
+ * failed BEFORE the fork (in that case the caller has to call vm_terminate()).
+ */
+static int start_vm(DataCenter *dc, Reservation *res, VM *vm) {
+	char vm_dir[MAX_PATH_SIZE];
+	char exec_full_path[MAX_PATH_SIZE];
+	char cpu_limit_str[16];
+
+	/* Folder where this VM will live: <root>/<reservation id>/<vm id> */
+	int path_len = snprintf(vm_dir, sizeof(vm_dir), "%s/%s/%s", VM_ROOT_DIR, res->id, vm->id);
+	if (path_len < 0 || (size_t)path_len >= sizeof(vm_dir)) {
 		fprintf(stderr, "VM directory path too long.\n");
 		return 1;
 	}
 
+	/* Give the VM its own copy of the input files. */
 	if (copy_dir_recursive(vm->type->input_folder, vm_dir) != 0) {
 		fprintf(stderr, "Failed to copy inputs of %s to %s.\n", vm->id, vm_dir);
 		return 1;
 	}
 
-	/* The child does chdir(), so give it an absolute path to the executable. */
-	if (absolute_path(vm->type->exec_path, exec_abs, sizeof(exec_abs)) != 0) {
+	/* The child will chdir() into the VM folder, so a relative path to the
+	 * executable would break. Resolve it to an absolute one first. */
+	if (absolute_path(vm->type->exec_path, exec_full_path, sizeof(exec_full_path)) != 0) {
 		fprintf(stderr, "Failed to resolve executable path of %s.\n", vm->id);
 		return 1;
 	}
 
-	snprintf(cpu_pct, sizeof(cpu_pct), "%d", cpu_percent(dc, vm));
+	snprintf(cpu_limit_str, sizeof(cpu_limit_str), "%d", cpu_limit_percent(dc, vm));
 
-	pid_t pid = fork();
-	if (pid < 0) {
+	pid_t child_pid = fork();
+	if (child_pid < 0) {
 		perror("fork");
 		return 1;
 	}
 
-	if (pid == 0) {
-		spawn_vm_child(vm, vm_dir, exec_abs, cpu_pct);
+	if (child_pid == 0) {
+		/* Child: this call only returns if something went wrong, hence the _exit. */
+		spawn_vm_child(vm, vm_dir, exec_full_path, cpu_limit_str);
 		_exit(1);
 	}
 
-	/* Parent: record pid/state under the server lock (L reads them there). */
+	/* Parent: save the pid and state while holding the server lock,
+	 * because the L command reads these fields under the same lock. */
 	pthread_mutex_lock(&vm->server->lock);
-	vm->pid = pid;
+	vm->pid = child_pid;
 	vm->state = VM_STATE_RUNNING;
 	pthread_mutex_unlock(&vm->server->lock);
 
-	/* One detached monitor thread per VM, so the caller (the thread that
-	 * is reading the .conf file) is released immediately. */
-	MonitorArg *m = malloc(sizeof(MonitorArg));
-	pthread_t tid;
+	/* One detached monitor thread per VM, so whoever called us (the thread
+	 * reading the .conf file) is free to carry on immediately.
+	 * If we can't get one, fall back to waiting right here in the current thread. */
+	if (start_monitor_thread(dc, res, vm) != 0)
+		wait_for_vm_then_terminate(dc, res, vm);
 
-	if (m != NULL) {
-		*m = (MonitorArg){dc, res, vm};
-		if (pthread_create(&tid, NULL, vm_monitor, m) == 0) {
-			pthread_detach(tid);
-			return 0;
-		}
-		free(m);
-	}
-
-	/* Could not create the monitor: degrade to waiting in this thread. */
-	wait_and_terminate(dc, res, vm);
 	return 0;
 }
 
+/* Starts every VM of a reservation. Returns 0 if all went well, 1 if at least one failed. */
 int spawn_all_vms(DataCenter *dc, Reservation *res) {
-	int rc = 0;
-	size_t n = res->num_vms;   // read BEFORE launching: res may be freed after the last VM ends
+	int result = 0;
+	/* Read the count BEFORE launching anything: once the last VM finishes,
+	 * the reservation itself may already have been freed. */
+	size_t vm_count = res->num_vms;
 
-	for (size_t i = 0; i < n; i++) {
-		VM *vm = res->vms[i];  // still valid: this VM has not been launched, so alive_vms > 0
+	for (size_t i = 0; i < vm_count; i++) {
+		VM *vm = res->vms[i];  /* safe to touch: this VM hasn't started yet, so the reservation still has living VMs */
 
-		if (launch_vm(dc, res, vm) != 0) {
-			rc = 1;
-			vm_terminate(dc, res, vm);   // release what it reserved
+		if (start_vm(dc, res, vm) != 0) {
+			result = 1;
+			vm_terminate(dc, res, vm);   /* give back the resources this VM had reserved */
 		}
 	}
 
-	return rc;
+	return result;
 }
 
 const char *vm_state_to_string(VMState state) {
-    switch (state) {
-        case VM_STATE_RESERVED:   return "RESERVED";
-        case VM_STATE_RUNNING:    return "RUNNING";
-        case VM_STATE_TERMINATED: return "TERMINATED";
-        default:                  return "UNKNOWN";
-    }
+	switch (state) {
+		case VM_STATE_RESERVED:   return "RESERVED";
+		case VM_STATE_RUNNING:    return "RUNNING";
+		case VM_STATE_TERMINATED: return "TERMINATED";
+		default:                  return "UNKNOWN";
+	}
 }
 
 const char *res_state_to_string(ReservationState state) {
-    switch (state) {
-			case RES_STATE_PENDING:  return "PENDING";
-			case RES_STATE_RUNNING:  return "RUNNING";
-			case RES_STATE_FINISHED: return "FINISHED";
-			default:                 return "UNKNOWN";
-    }
+	switch (state) {
+		case RES_STATE_PENDING:  return "PENDING";
+		case RES_STATE_RUNNING:  return "RUNNING";
+		case RES_STATE_FINISHED: return "FINISHED";
+		default:                 return "UNKNOWN";
+	}
 }
