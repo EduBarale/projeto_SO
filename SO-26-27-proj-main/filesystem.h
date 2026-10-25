@@ -36,35 +36,41 @@ int file_exists(const char *path);
 int absolute_path(const char *path, char *buffer, size_t size);
 
 /**
- * Lists the regular files with extension ".conf" inside a directory, sorted
- * alphabetically. Every entry is the full path ("<dir>/<name>").
- *
- * @param dir Directory to scan.
- * @param files Output: malloc'd array of malloc'd strings.
- * @param count Output: number of entries in the array.
- *
- * @return 0 on success (free with free_file_list()), 1 on error.
+ * Lists files ending in ".conf" inside a directory, sorted alphabetically
+ * using strcmp to sort.
+ * 
+ * @param dir Directory to search.
+ * @param files [out] Array of strings (names of files).
+ * @param count [out] Number of files.
+ * 
+ * @return 0 if sucess, 1 if there was an error (cannot open directory, no memory).
  */
 int list_conf_files(const char *dir, char ***files, size_t *count);
 
 /**
  * Frees an array created by list_conf_files().
+ * 
+ * @param files Array from list_conf_files().
+ * @param count Number of entries in the array.
  */
 void free_file_list(char **files, size_t count);
 
 /**
- * Creates a directory and all missing parents (like "mkdir -p").
- *
- * @return 0 on success (also if it already exists), 1 on error.
+ * Creats a directory and can use the ones that already exist.
+ * 
+ * @param path Directory to be created.
+ * 
+ * @return 0 if sucess, 1 if error.
  */
 int make_dirs(const char *path);
 
 /**
- * Recursively copies the content of directory src into directory dst
- * (created if needed). Subdirectories and regular files are preserved.
- * Only POSIX file descriptors are used (open/read/write), never stdio.
- *
- * @return 0 on success, 1 on error.
+ * Copies recursively the content from the starting directory (src) to the 
+ * final one (dst).
+ * @param src Inicial directory.
+ * @param dst Destination directory.
+ * 
+ * @return 0 if sucess, 1 if error.
  */
 int copy_dir_recursive(const char *src, const char *dst);
 
