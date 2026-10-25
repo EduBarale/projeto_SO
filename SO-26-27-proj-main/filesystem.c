@@ -160,7 +160,7 @@ static int copy_file(const char *from, const char *to, mode_t mode){
   pode devolver menos do que a constante 8192 */
   while ((size = read(original, piece, sizeof(piece))) > 0) {
     /* o write pode escrever menos do que 8192, trata se com erro esse caso */
-    if (write(copy, piece, size) != size)
+    if (write(copy, piece, (size_t)size) != size)
       status = 1;
   }
   if (size < 0) /* termina com erro de leitura e não EOF*/
