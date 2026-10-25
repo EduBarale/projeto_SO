@@ -10,7 +10,10 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 
-#define VM_ROOT_DIR "/tmp/CloudIST"
+#ifndef STUDENT_ID
+#define STUDENT_ID "117265"
+#endif
+#define VM_ROOT_DIR "/tmp/CloudIST-" STUDENT_ID
 
 VMType *VMType_exists(DataCenter *dc, const char* type_id){
 	for(size_t i = 0; i < dc->num_vm_types; i++){
