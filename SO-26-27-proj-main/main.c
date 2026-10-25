@@ -116,35 +116,36 @@ static void process_conf(DataCenter *dc, int fd){
 	}
 }
 
-/* ---------------- Exercise 3: pool of worker threads ---------------- */
+/* ---------------- Exercício 3: pool de threads ---------------- */
 
 typedef struct {
 	DataCenter *dc;
-	char **files;            // .conf paths, already sorted alphabetically
-	size_t count;
-	size_t next;             // index of the next file to process
-	pthread_mutex_t lock;    // protects `next`
-} WorkQueue;
+	char **paths;           // caminhos dos ficheiros .conf
+	size_t total;           // quantos ficheiros há
+	size_t next_file;       // próximo ficheiro que ninguém pegou
+	pthread_mutex_t lock;   // protege next_file
+} Queue;
 
-static void *worker_main(void *arg){
-	WorkQueue *q = arg;
+static void *worker(void *arg){
+	Queue *queue = arg;
 
 	while (1) {
-		pthread_mutex_lock(&q->lock);
-		size_t idx = q->next < q->count ? q->next++ : q->count;
-		pthread_mutex_unlock(&q->lock);
+		/* Pegar num ficheiro: ler e avançar o contador tem de ser atómico */
+		pthread_mutex_lock(&queue->lock);
+		size_t file = queue->next_file++;
+		pthread_mutex_unlock(&queue->lock);
 
-		if (idx >= q->count)
-			break;
+		if (file >= queue->total)
+			break;   // já não há ficheiros
 
-		// O_CLOEXEC: VM children must not inherit the .conf descriptor.
-		int fd = open(q->files[idx], O_RDONLY | O_CLOEXEC);
+		/* O_CLOEXEC: as VMs (processos filhos) não herdam este fd */
+		int fd = open(queue->paths[file], O_RDONLY | O_CLOEXEC);
 		if (fd < 0) {
-			perror(q->files[idx]);
+			perror(queue->paths[file]);
 			continue;
 		}
 
-		process_conf(q->dc, fd);
+		process_conf(queue->dc, fd);
 		close(fd);
 	}
 
@@ -194,47 +195,51 @@ int main(int argc, char **argv){
 		return 1;
 	}
 
-	WorkQueue queue = { .dc = &dc, .files = NULL, .count = 0, .next = 0 };
+	/* (dentro do main) */
+
+	Queue queue = { .dc = &dc };
 	pthread_mutex_init(&queue.lock, NULL);
 
-	if (list_conf_files(input_dir, &queue.files, &queue.count) != 0) {
+	if (list_conf_files(input_dir, &queue.paths, &queue.total) != 0) {
 		fprintf(stderr, "Failed to list .conf files in %s.\n", input_dir);
 		datacenter_destroy(&dc);
 		return 1;
 	}
 
-	// Never more threads than files.
-	size_t nthreads = max_threads < queue.count ? max_threads : queue.count;
-	pthread_t *threads = malloc((nthreads ? nthreads : 1) * sizeof(pthread_t));
-	size_t created = 0;
+	/* Nunca mais threads do que ficheiros */
+	size_t n_threads = max_threads < queue.total ? max_threads : queue.total;
 
+	/* "+ 1" para o malloc nunca receber 0 */
+	pthread_t *threads = malloc((n_threads + 1) * sizeof(pthread_t));
 	if (threads == NULL) {
 		fprintf(stderr, "Out of memory.\n");
-		free_file_list(queue.files, queue.count);
+		free_file_list(queue.paths, queue.total);
 		datacenter_destroy(&dc);
 		return 1;
 	}
 
-	for (size_t i = 0; i < nthreads; i++) {
-		if (pthread_create(&threads[created], NULL, worker_main, &queue) != 0) {
+	/* Contamos as que arrancaram, porque a criação pode falhar a meio */
+	size_t started = 0;
+	for (size_t i = 0; i < n_threads; i++) {
+		if (pthread_create(&threads[started], NULL, worker, &queue) != 0) {
 			fprintf(stderr, "Failed to create worker thread.\n");
-			break;   // the workers already created will consume the whole queue
+			break;
 		}
-		created++;
+		started++;
 	}
 
-	if (created == 0 && queue.count > 0)
-		worker_main(&queue);   // no thread could be created: run sequentially
+	/* Se nenhuma arrancou, o main faz o trabalho sozinho */
+	if (started == 0)
+		worker(&queue);
 
-	for (size_t i = 0; i < created; i++)
+	for (size_t i = 0; i < started; i++)
 		pthread_join(threads[i], NULL);
 
-	// All files processed. VMs may still be running in their own processes:
-	// wait for them before tearing the data center down.
+	/* As VMs são processos à parte: esperar por elas antes de destruir */
 	datacenter_wait_all(&dc);
 
 	free(threads);
-	free_file_list(queue.files, queue.count);
+	free_file_list(queue.paths, queue.total);
 	pthread_mutex_destroy(&queue.lock);
 	datacenter_destroy(&dc);
 
